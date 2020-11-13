@@ -437,6 +437,7 @@ class VideoService(QObject):
             self.smartcut_jobs[index].files.get('middle'),
             self.smartcut_jobs[index].files.get('end')
         ]
+        joinlist = list(filter(None, joinlist))
         if self.isMPEGcodec(joinlist[1]):
             self.logger.info('smartcut files are MPEG based so join via MPEG-TS')
             final_join = self.mpegtsJoin(joinlist, self.smartcut_jobs[index].output, None)
