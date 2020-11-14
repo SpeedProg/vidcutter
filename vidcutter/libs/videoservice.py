@@ -30,6 +30,7 @@ import shlex
 import sys
 from bisect import bisect_left
 from functools import partial
+from math import isclose
 from typing import List, Optional, Union
 
 from PyQt5.QtCore import (pyqtSignal, pyqtSlot, QDir, QFileInfo, QObject, QProcess, QProcessEnvironment, QSettings,
@@ -332,7 +333,7 @@ class VideoService(QObject):
         self.smartcut_jobs[index].output = output
         self.smartcut_jobs[index].allstreams = allstreams
         # ----------------------[ STEP 1 - start of clip if not starting on a keyframe ]-------------------------
-        if bisections['start'][1] > bisections['start'][0]:
+        if bisections['start'][1] > bisections['start'][0] and not isclose(bisections['start'][1], start, abs_tol=0.00001):
             self.smartcut_jobs[index].files.update(start='{0}_start_{1}{2}'
                                                    .format(output_file, '{0:0>2}'.format(index), output_ext))
             startproc = VideoService.initProc(self.backends.ffmpeg, self.smartcheck, os.path.dirname(source))
@@ -369,7 +370,7 @@ class VideoService(QObject):
         if len(self.smartcut_jobs[index].procs) == 1:
             middleproc.start()
         # ----------------------[ STEP 3 - end of clip if not ending on a keyframe ]-------------------------
-        if bisections['end'][2] > bisections['end'][1]:
+        if bisections['end'][2] > bisections['end'][1] and not isclose(bisections['end'][1], end, abs_tol=0.00001):
             self.smartcut_jobs[index].files.update(end='{0}_end_{1}{2}'
                                                    .format(output_file, '{0:0>2}'.format(index), output_ext))
             endproc = VideoService.initProc(self.backends.ffmpeg, self.smartcheck, os.path.dirname(source))
