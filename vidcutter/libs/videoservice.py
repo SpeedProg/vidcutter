@@ -28,7 +28,7 @@ import os
 import re
 import shlex
 import sys
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from functools import partial
 from math import isclose
 from typing import List, Optional, Union
@@ -292,16 +292,25 @@ class VideoService(QObject):
         return False
 
     def cut(self, source: str, output: str, frametime: str, duration: str, allstreams: bool=True, vcodec: str=None,
-            run: bool=True) -> Union[bool, str]:
+            run: bool=True, duration_is_to: bool=False) -> Union[bool, str]:
         self.checkDiskSpace(output)
         stream_map = self.parseMappings(allstreams)
-        if vcodec is not None:
-            encode_options = VideoService.config.encoding.get(vcodec, vcodec)
-            args = '-v 32 -i "{}" -ss {} -t {} -c:v {} -c:a copy -c:s copy {}-avoid_negative_ts 1 ' \
-                   '-y "{}"'.format(source, frametime, duration, encode_options, stream_map, output)
+        if duration_is_to:
+            if vcodec is not None:
+                encode_options = VideoService.config.encoding.get(vcodec, vcodec)
+                args = '-v 32 -i "{}" -ss {} -to {} -c:v {} -c:a copy -c:s copy {}-avoid_negative_ts 1 ' \
+                       '-y "{}"'.format(source, frametime, duration, encode_options, stream_map, output)
+            else:
+                args = '-v error -ss {} -to {} -i "{}" -c copy {}-avoid_negative_ts 1 -y "{}"' \
+                       .format(frametime, duration, source, stream_map, output)
         else:
-            args = '-v error -ss {} -t {} -i "{}" -c copy {}-avoid_negative_ts 1 -y "{}"' \
-                   .format(frametime, duration, source, stream_map, output)
+            if vcodec is not None:
+                encode_options = VideoService.config.encoding.get(vcodec, vcodec)
+                args = '-v 32 -i "{}" -ss {} -t {} -c:v {} -c:a copy -c:s copy {}-avoid_negative_ts 1 ' \
+                       '-y "{}"'.format(source, frametime, duration, encode_options, stream_map, output)
+            else:
+                args = '-v error -ss {} -t {} -i "{}" -c copy {}-avoid_negative_ts 1 -y "{}"' \
+                       .format(frametime, duration, source, stream_map, output)
         if run:
             result = self.cmdExec(self.backends.ffmpeg, args)
             if not result or os.path.getsize(output) < 1000:
@@ -328,25 +337,33 @@ class VideoService(QObject):
         ]
 
     def smartcut(self, index: int, source: str, output: str, start: float, end: float, allstreams: bool = True) -> None:
+        use_to = True
         output_file, output_ext = os.path.splitext(output)
         bisections = self.getGOPbisections(source, start, end)
         self.smartcut_jobs[index].output = output
         self.smartcut_jobs[index].allstreams = allstreams
         # ----------------------[ STEP 1 - start of clip if not starting on a keyframe ]-------------------------
-        if bisections['start'][1] > bisections['start'][0] and not isclose(bisections['start'][1], start, abs_tol=0.00001):
+        # we want to cut from start to bisections['start'][0]
+        # or not at all if they are the same time
+        has_odd_start = not isclose(bisections['start'][0], start, abs_tol=0.00001)
+        has_odd_end = not isclose(bisections['end'][1], end, rel_tol=0.00001)
+        if has_odd_start:
             self.smartcut_jobs[index].files.update(start='{0}_start_{1}{2}'
                                                    .format(output_file, '{0:0>2}'.format(index), output_ext))
             startproc = VideoService.initProc(self.backends.ffmpeg, self.smartcheck, os.path.dirname(source))
             startproc.setObjectName('start.{}'.format(index))
             startproc.started.connect(lambda: self.progress.emit(index))
+            duration = bisections['start'][0]
+            if not use_to:
+                duration = duration - start
             startproc.setArguments(shlex.split(
                 self.cut(source=source,
                          output=self.smartcut_jobs[index].files['start'],
                          frametime=str(start),
-                         duration=bisections['start'][1] - start,
+                         duration=duration,
                          allstreams=allstreams,
                          vcodec=self.streams.video.codec_name,
-                         run=False)))
+                         run=False, duration_is_to=use_to)))
             self.smartcut_jobs[index].procs.update(start=startproc)
             self.smartcut_jobs[index].results.update(start=False)
             startproc.start()
@@ -358,32 +375,42 @@ class VideoService(QObject):
         middleproc.setWorkingDirectory(os.path.dirname(self.smartcut_jobs[index].files['middle']))
         middleproc.setObjectName('middle.{}'.format(index))
         middleproc.started.connect(lambda: self.progress.emit(index))
+        duration = bisections['end'][1]
+        duration = bisections['end'][1]
+        frametime = bisections['start'][1]
+        if not use_to:
+            duration = duration - frametime
+
         middleproc.setArguments(shlex.split(
             self.cut(source=source,
                      output=self.smartcut_jobs[index].files['middle'],
-                     frametime=bisections['start'][2],
-                     duration=bisections['end'][1] - bisections['start'][2],
+                     frametime=frametime,
+                     duration=duration,
                      allstreams=allstreams,
-                     run=False)))
+                     run=False, duration_is_to=use_to)))
+
         self.smartcut_jobs[index].procs.update(middle=middleproc)
         self.smartcut_jobs[index].results.update(middle=False)
         if len(self.smartcut_jobs[index].procs) == 1:
             middleproc.start()
         # ----------------------[ STEP 3 - end of clip if not ending on a keyframe ]-------------------------
-        if bisections['end'][2] > bisections['end'][1] and not isclose(bisections['end'][1], end, abs_tol=0.00001):
+        if has_odd_end:
             self.smartcut_jobs[index].files.update(end='{0}_end_{1}{2}'
                                                    .format(output_file, '{0:0>2}'.format(index), output_ext))
             endproc = VideoService.initProc(self.backends.ffmpeg, self.smartcheck, os.path.dirname(source))
             endproc.setObjectName('end.{}'.format(index))
             endproc.started.connect(lambda: self.progress.emit(index))
+            duration = end
+            if not use_to:
+                duration = duration - bisections['end'][1]
             endproc.setArguments(shlex.split(
                 self.cut(source=source,
                          output=self.smartcut_jobs[index].files['end'],
                          frametime=bisections['end'][1],
-                         duration=end - bisections['end'][1],
+                         duration=duration,
                          allstreams=allstreams,
                          vcodec=self.streams.video.codec_name,
-                         run=False)))
+                         run=False, duration_is_to=use_to)))
             self.smartcut_jobs[index].procs.update(end=endproc)
             self.smartcut_jobs[index].results.update(end=False)
 
@@ -451,10 +478,7 @@ class VideoService(QObject):
 
     @staticmethod
     def cleanup(files: List[str]) -> None:
-        try:
-            [os.remove(file) for file in files]
-        except FileNotFoundError:
-            pass
+        pass
 
     def join(self, inputs: List[str], output: str, allstreams: bool=True, chapters: Optional[List[str]]=None) -> bool:
         self.checkDiskSpace(output)
@@ -470,7 +494,7 @@ class VideoService(QObject):
             metadata = ''
         args = '-v error -f concat -safe 0 -i "{0}" {1}-c copy {2}-y "{3}"'
         result = self.cmdExec(self.backends.ffmpeg, args.format(filelist, metadata, stream_map, output))
-        os.remove(filelist)
+        #os.remove(filelist)
         if chapters and ffmetadata is not None:
             os.remove(ffmetadata)
         return result
@@ -589,7 +613,18 @@ class VideoService(QObject):
     def getGOPbisections(self, source: str, start: float, end: float) -> dict:
         keyframes = self.getKeyframes(source)
         start_pos = bisect_left(keyframes, start)
-        end_pos = bisect_left(keyframes, end)
+        end_pos = bisect_right(keyframes, end)
+        return {
+            'start': (
+                keyframes[start_pos],
+                keyframes[start_pos + 1],
+            ),
+            'end': (
+                keyframes[end_pos - 1],
+                keyframes[end_pos - 2],
+            ),
+        }
+        """
         return {
             'start': (
                 keyframes[start_pos - 1] if start_pos > 0 else keyframes[start_pos],
@@ -602,6 +637,7 @@ class VideoService(QObject):
                 keyframes[end_pos]
             )
         }
+        """
 
     def isMPEGcodec(self, source: str = None) -> bool:
         if source is None and hasattr(self.streams, 'video'):
@@ -643,7 +679,7 @@ class VideoService(QObject):
                        .format("|".join(map(str, outfiles)), metadata, audio_bsf, output)
                 result = self.cmdExec(self.backends.ffmpeg, args)
                 # 3. cleanup mpegts files
-                [os.remove(file) for file in outfiles]
+                #[os.remove(file) for file in outfiles]
                 if chapters and ffmetadata is not None:
                     os.remove(ffmetadata)
         except BaseException:
